@@ -1,3 +1,4 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:provider/provider.dart';
@@ -24,6 +25,18 @@ class _ViewerScreenState extends State<ViewerScreen> {
   final PdfViewerController _pdfController = PdfViewerController();
   int _currentPageIndex = 0;
   bool _eraserActive = false;
+
+  // In "Parmak" (finger-draw) mode, Scribble's overlay captures every touch
+  // pointer for drawing, which blocks pdfrx's own pinch/pan gesture handling.
+  // We track raw touch pointers here so a 2-finger touch can still pan/zoom
+  // the page even while single-finger touches are reserved for drawing.
+  final Map<int, Offset> _activeTouchPoints = {};
+  double? _lastPinchDistance;
+  Offset? _lastPinchFocal;
+
+  // Tracks the stylus' barrel-button bitmask so we can detect a fresh press
+  // (rising edge) instead of re-triggering on every event while held.
+  int _lastStylusButtons = 0;
 
   static const _penColors = AppColors.penColors;
   static const _penWidths = <double>[2, 4, 8];
@@ -58,6 +71,111 @@ class _ViewerScreenState extends State<ViewerScreen> {
   void _goToPage(int pageIndex) {
     final clamped = pageIndex.clamp(0, widget.entry.pageCount - 1);
     _pdfController.goToPage(pageNumber: clamped + 1);
+  }
+
+  void _toggleEraser() {
+    setState(() => _eraserActive = !_eraserActive);
+    _annotationController.setEraserActive(_currentPageIndex, _eraserActive);
+  }
+
+  void _returnToPen() {
+    if (!_eraserActive) return;
+    setState(() => _eraserActive = false);
+    _annotationController.setColor(_annotationController.selectedColor);
+  }
+
+  void _handleTouchDown(PointerDownEvent event) {
+    if (event.kind == PointerDeviceKind.touch) {
+      _activeTouchPoints[event.pointer] = event.localPosition;
+      _lastPinchDistance = null;
+      _lastPinchFocal = null;
+    }
+    _checkStylusButtons(event);
+  }
+
+  void _handleTouchMove(PointerMoveEvent event) {
+    if (event.kind == PointerDeviceKind.touch && _activeTouchPoints.containsKey(event.pointer)) {
+      _activeTouchPoints[event.pointer] = event.localPosition;
+      _updatePinchZoom();
+    }
+    _checkStylusButtons(event);
+  }
+
+  void _handleTouchEnd(PointerEvent event) {
+    if (event.kind == PointerDeviceKind.touch) {
+      _activeTouchPoints.remove(event.pointer);
+      _lastPinchDistance = null;
+      _lastPinchFocal = null;
+    }
+    _checkStylusButtons(event);
+  }
+
+  void _handleStylusHover(PointerHoverEvent event) {
+    _checkStylusButtons(event);
+  }
+
+  /// The pen's barrel buttons are only reported through raw [PointerEvent]s,
+  /// not through Scribble's drawing logic, so we watch them here and diff
+  /// against the previously seen state to fire only on a fresh press (not on
+  /// every event while a button stays held).
+  void _checkStylusButtons(PointerEvent event) {
+    if (event.kind != PointerDeviceKind.stylus && event.kind != PointerDeviceKind.invertedStylus) {
+      return;
+    }
+    final pressedNow = event.buttons & ~_lastStylusButtons;
+    if (pressedNow & kPrimaryStylusButton != 0) {
+      _toggleEraser();
+    }
+    if (pressedNow & kSecondaryStylusButton != 0) {
+      _returnToPen();
+    }
+    _lastStylusButtons = event.buttons;
+  }
+
+  /// Manually drives 2-finger pinch-zoom + pan while in "Parmak" mode, where
+  /// Scribble owns every touch pointer and pdfrx's built-in InteractiveViewer
+  /// never sees them. In "Kalem" mode this is a no-op: fingers already pass
+  /// straight through to pdfrx's native pinch/pan since only the stylus is
+  /// captured for drawing.
+  void _updatePinchZoom() {
+    if (_annotationController.stylusOnly) return;
+    if (_activeTouchPoints.length != 2) return;
+
+    final points = _activeTouchPoints.values.toList(growable: false);
+    final p1 = points[0];
+    final p2 = points[1];
+    final distance = (p1 - p2).distance;
+    final focal = Offset((p1.dx + p2.dx) / 2, (p1.dy + p2.dy) / 2);
+
+    if (_lastPinchDistance == null || _lastPinchFocal == null) {
+      _lastPinchDistance = distance;
+      _lastPinchFocal = focal;
+      return;
+    }
+
+    final matrix = _pdfController.value;
+    final zoom = matrix.zoom;
+    final scaleDelta = distance / _lastPinchDistance!.clamp(1.0, double.infinity);
+    final newZoom = (zoom * scaleDelta).clamp(0.5, 8.0);
+
+    // Keep the document point that was under the previous focal point
+    // anchored under the new focal point, so the pinch feels natural.
+    final focalDoc = Offset(
+      (_lastPinchFocal!.dx - matrix.xZoomed) / zoom,
+      (_lastPinchFocal!.dy - matrix.yZoomed) / zoom,
+    );
+
+    final newMatrix = Matrix4.identity()
+      ..storage[0] = newZoom
+      ..storage[5] = newZoom
+      ..storage[10] = newZoom
+      ..storage[12] = -focalDoc.dx * newZoom + focal.dx
+      ..storage[13] = -focalDoc.dy * newZoom + focal.dy;
+
+    _pdfController.value = newMatrix;
+
+    _lastPinchDistance = distance;
+    _lastPinchFocal = focal;
   }
 
   Future<void> _jumpToPageDialog() async {
@@ -225,15 +343,22 @@ class _ViewerScreenState extends State<ViewerScreen> {
                     children: [
                       Padding(
                         padding: const EdgeInsets.only(top: 22),
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: AppColors.surface,
-                            border: Border.all(color: AppColors.borderPaper),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          margin: const EdgeInsets.symmetric(horizontal: 40),
-                          clipBehavior: Clip.antiAlias,
-                          child: PdfViewer.file(
+                        child: Listener(
+                          behavior: HitTestBehavior.translucent,
+                          onPointerDown: _handleTouchDown,
+                          onPointerMove: _handleTouchMove,
+                          onPointerUp: _handleTouchEnd,
+                          onPointerCancel: _handleTouchEnd,
+                          onPointerHover: _handleStylusHover,
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: AppColors.surface,
+                              border: Border.all(color: AppColors.borderPaper),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            margin: const EdgeInsets.symmetric(horizontal: 40),
+                            clipBehavior: Clip.antiAlias,
+                            child: PdfViewer.file(
                             sourcePath,
                             controller: _pdfController,
                             params: PdfViewerParams(
@@ -262,6 +387,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
                                 ];
                               },
                             ),
+                          ),
                           ),
                         ),
                       ),
@@ -439,10 +565,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
                       tooltip: 'Silgi',
                       icon: _eraserActive ? Icons.auto_fix_high : Icons.auto_fix_normal,
                       selected: _eraserActive,
-                      onPressed: () {
-                        setState(() => _eraserActive = !_eraserActive);
-                        _annotationController.setEraserActive(_currentPageIndex, _eraserActive);
-                      },
+                      onPressed: _toggleEraser,
                     ),
                     _toolbarIcon(
                       tooltip: 'Geri al',
