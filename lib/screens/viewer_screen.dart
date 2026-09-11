@@ -37,6 +37,35 @@ class _ViewerScreenState extends State<ViewerScreen> {
   // Tracks the stylus' barrel-button bitmask so we can detect a fresh press
   // (rising edge) instead of re-triggering on every event while held.
   int _lastStylusButtons = 0;
+  // The primary button is a *temporary* hold (matches a real eraser): while
+  // held we force eraser mode, and on release we restore whatever tool was
+  // active before the press. A permanent toggle here is what made drawing
+  // feel "stuck" — a stray brush of the button mid-stroke would leave you
+  // erasing indefinitely with no obvious way back.
+  bool _stylusButtonHeld = false;
+  bool _eraserStateBeforeHold = false;
+
+  bool _stylusDetected = false;
+  bool _stylusIntroDismissed = false;
+
+  // PdfViewerController.value throws until pdfrx has actually attached its
+  // internal state to the controller, which happens asynchronously after the
+  // document loads — so the zoom chip (which reads .value) must wait for
+  // this instead of mounting alongside the viewer.
+  bool _pdfReady = false;
+
+  final List<Color> _customColors = [];
+  static const _maxCustomColors = 4;
+  static const _customColorChoices = <Color>[
+    Color(0xFFF57C00), // orange
+    Color(0xFF8E24AA), // purple
+    Color(0xFF00897B), // teal
+    Color(0xFFD81B60), // pink
+    Color(0xFF6D4C41), // brown
+    Color(0xFFFDD835), // yellow
+    Color(0xFF00ACC1), // cyan
+    Color(0xFF546E7A), // blue-grey
+  ];
 
   static const _penColors = AppColors.penColors;
   static const _penWidths = <double>[2, 4, 8];
@@ -107,6 +136,13 @@ class _ViewerScreenState extends State<ViewerScreen> {
       _lastPinchDistance = null;
       _lastPinchFocal = null;
     }
+    // The tip lifting or the pointer being cancelled is also the safest
+    // moment to guarantee the temporary eraser hold ends, even if the
+    // hardware never reports a clean button-release event for it.
+    if (event.kind == PointerDeviceKind.stylus || event.kind == PointerDeviceKind.invertedStylus) {
+      _releaseStylusHold();
+      _lastStylusButtons = 0;
+    }
     _checkStylusButtons(event);
   }
 
@@ -122,14 +158,41 @@ class _ViewerScreenState extends State<ViewerScreen> {
     if (event.kind != PointerDeviceKind.stylus && event.kind != PointerDeviceKind.invertedStylus) {
       return;
     }
+    if (!_stylusDetected) {
+      setState(() => _stylusDetected = true);
+    }
     final pressedNow = event.buttons & ~_lastStylusButtons;
-    if (pressedNow & kPrimaryStylusButton != 0) {
-      _toggleEraser();
+    final releasedNow = _lastStylusButtons & ~event.buttons;
+
+    if (pressedNow & kPrimaryStylusButton != 0 && !_stylusButtonHeld) {
+      _stylusButtonHeld = true;
+      _eraserStateBeforeHold = _eraserActive;
+      if (!_eraserActive) {
+        setState(() => _eraserActive = true);
+        _annotationController.setEraserActive(_currentPageIndex, true);
+      }
+    }
+    if (releasedNow & kPrimaryStylusButton != 0) {
+      _releaseStylusHold();
     }
     if (pressedNow & kSecondaryStylusButton != 0) {
       _returnToPen();
     }
     _lastStylusButtons = event.buttons;
+  }
+
+  /// Ends the primary button's temporary eraser hold and restores whatever
+  /// tool was active right before it was pressed.
+  void _releaseStylusHold() {
+    if (!_stylusButtonHeld) return;
+    _stylusButtonHeld = false;
+    if (_eraserActive == _eraserStateBeforeHold) return;
+    setState(() => _eraserActive = _eraserStateBeforeHold);
+    if (_eraserStateBeforeHold) {
+      _annotationController.setEraserActive(_currentPageIndex, true);
+    } else {
+      _annotationController.setColor(_annotationController.selectedColor);
+    }
   }
 
   /// Manually drives 2-finger pinch-zoom + pan while in "Parmak" mode, where
@@ -363,6 +426,9 @@ class _ViewerScreenState extends State<ViewerScreen> {
                             controller: _pdfController,
                             params: PdfViewerParams(
                               backgroundColor: AppColors.surface,
+                              onViewerReady: (document, controller) {
+                                if (mounted) setState(() => _pdfReady = true);
+                              },
                               onPageChanged: (pageNumber) {
                                 if (pageNumber == null) return;
                                 setState(() => _currentPageIndex = pageNumber - 1);
@@ -392,6 +458,15 @@ class _ViewerScreenState extends State<ViewerScreen> {
                         ),
                       ),
                       Positioned(left: 0, right: 0, bottom: 22, child: Center(child: _buildToolbar())),
+                      if (_pdfReady) Positioned(right: 20, bottom: 108, child: _buildZoomChip()),
+                      if (_stylusDetected && !_stylusIntroDismissed)
+                        Positioned(
+                          left: 40,
+                          bottom: 108,
+                          child: _StylusIntroCard(
+                            onDismiss: () => setState(() => _stylusIntroDismissed = true),
+                          ),
+                        ),
                     ],
                   );
                 },
@@ -554,6 +629,8 @@ class _ViewerScreenState extends State<ViewerScreen> {
                 children: [
                   _toolGroup([
                     for (final color in _penColors) _colorSwatch(color),
+                    for (final color in _customColors) _colorSwatch(color, removable: true),
+                    _addColorButton(),
                   ]),
                   _groupDivider(),
                   _toolGroup([
@@ -593,17 +670,42 @@ class _ViewerScreenState extends State<ViewerScreen> {
                       onTap: () => _annotationController.setStylusOnly(false),
                     ),
                   ]),
-                  _groupDivider(),
-                  _toolGroup([
-                    _toolbarIcon(
-                      tooltip: 'Yakınlaştır',
-                      icon: Icons.zoom_in,
-                      onPressed: () => _pdfController.zoomUp(loop: true),
-                    ),
-                  ]),
                 ],
               ),
             ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildZoomChip() {
+    return ValueListenableBuilder<Matrix4>(
+      valueListenable: _pdfController,
+      builder: (context, matrix, _) {
+        final percent = (matrix.zoom * 100).round();
+        return Container(
+          height: 40,
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.94),
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(color: AppColors.borderToolbar),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withValues(alpha: 0.10), blurRadius: 8, offset: const Offset(0, 2)),
+            ],
+          ),
+          alignment: Alignment.center,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.zoom_in, size: 16, color: AppColors.textSecondary),
+              const SizedBox(width: 8),
+              Text(
+                '%$percent · iki parmakla yakınlaştır',
+                style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w500, color: AppColors.textSecondary),
+              ),
+            ],
           ),
         );
       },
@@ -676,7 +778,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
     );
   }
 
-  Widget _colorSwatch(Color color) {
+  Widget _colorSwatch(Color color, {bool removable = false}) {
     final selected = _annotationController.selectedColor == color && !_eraserActive;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -685,6 +787,11 @@ class _ViewerScreenState extends State<ViewerScreen> {
           setState(() => _eraserActive = false);
           _annotationController.setColor(color);
         },
+        onLongPress: removable
+            ? () {
+                setState(() => _customColors.remove(color));
+              }
+            : null,
         borderRadius: BorderRadius.circular(999),
         child: Container(
           width: 48,
@@ -709,6 +816,108 @@ class _ViewerScreenState extends State<ViewerScreen> {
         ),
       ),
     );
+  }
+
+  Widget _addColorButton() {
+    final count = _customColors.length;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: InkWell(
+        onTap: _showCustomColorPicker,
+        borderRadius: BorderRadius.circular(999),
+        child: SizedBox(
+          width: 48,
+          height: 48,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Center(
+                child: Container(
+                  width: 30,
+                  height: 30,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(color: AppColors.borderCard, style: BorderStyle.solid),
+                  ),
+                  alignment: Alignment.center,
+                  child: const Icon(Icons.add, size: 16, color: AppColors.textSecondary),
+                ),
+              ),
+              if (count > 0)
+                Positioned(
+                  right: 1,
+                  bottom: 1,
+                  child: Container(
+                    constraints: const BoxConstraints(minWidth: 17, minHeight: 17),
+                    padding: const EdgeInsets.symmetric(horizontal: 3),
+                    decoration: BoxDecoration(
+                      color: AppColors.primary,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: AppColors.surface, width: 2),
+                    ),
+                    alignment: Alignment.center,
+                    child: Text(
+                      '$count',
+                      style: const TextStyle(color: Colors.white, fontSize: 10.5, fontWeight: FontWeight.w700, height: 1),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showCustomColorPicker() async {
+    final picked = await showDialog<Color>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Renk ekle'),
+        content: SizedBox(
+          width: 280,
+          child: Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: [
+              for (final color in _customColorChoices)
+                InkWell(
+                  onTap: () => Navigator.pop(context, color),
+                  borderRadius: BorderRadius.circular(999),
+                  child: Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      color: color,
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: _customColors.contains(color) ? AppColors.primary : Colors.transparent,
+                        width: 3,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Kapat')),
+        ],
+      ),
+    );
+    if (picked == null || !mounted) return;
+    if (_customColors.contains(picked)) {
+      setState(() => _customColors.remove(picked));
+      return;
+    }
+    setState(() {
+      if (_customColors.length >= _maxCustomColors) {
+        _customColors.removeAt(0);
+      }
+      _customColors.add(picked);
+      _eraserActive = false;
+    });
+    _annotationController.setColor(picked);
   }
 
   Widget _widthButton(double width) {
@@ -753,6 +962,93 @@ class _MenuRow extends StatelessWidget {
         const SizedBox(width: 12),
         Text(label, style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500, color: effectiveColor)),
       ],
+    );
+  }
+}
+
+class _StylusIntroCard extends StatelessWidget {
+  const _StylusIntroCard({required this.onDismiss});
+
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 280,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: AppColors.borderHeader),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withValues(alpha: 0.20), blurRadius: 28, offset: const Offset(0, 10)),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Text('Kalem tuşları', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+              ),
+              InkWell(
+                onTap: onDismiss,
+                borderRadius: BorderRadius.circular(999),
+                child: const Padding(
+                  padding: EdgeInsets.all(2),
+                  child: Icon(Icons.close, size: 18, color: AppColors.textTertiary),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          _buttonRow(number: '1', label: 'Alt tuş', actionLabel: 'Silgi'),
+          const SizedBox(height: 8),
+          _buttonRow(number: '2', label: 'Üst tuş', actionLabel: 'Kaleme dön'),
+          const SizedBox(height: 10),
+          const Text(
+            'Basılı tut: silgiye geçici geçiş, bırakınca kaleme döner.',
+            style: TextStyle(fontSize: 12, height: 1.45, color: AppColors.textTertiary),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buttonRow({required String number, required String label, required String actionLabel}) {
+    return Container(
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      decoration: BoxDecoration(color: AppColors.thumbFill, borderRadius: BorderRadius.circular(12)),
+      child: Row(
+        children: [
+          Container(
+            width: 24,
+            height: 24,
+            decoration: BoxDecoration(
+              color: AppColors.surface,
+              shape: BoxShape.circle,
+              border: Border.all(color: AppColors.borderToolbar),
+            ),
+            alignment: Alignment.center,
+            child: Text(number, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.textSecondary)),
+          ),
+          const SizedBox(width: 10),
+          Expanded(child: Text(label, style: const TextStyle(fontSize: 12.5, color: AppColors.textSecondary))),
+          Container(
+            height: 28,
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            decoration: BoxDecoration(color: AppColors.accentContainer, borderRadius: BorderRadius.circular(999)),
+            alignment: Alignment.center,
+            child: Text(
+              actionLabel,
+              style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: AppColors.onAccentContainer),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
